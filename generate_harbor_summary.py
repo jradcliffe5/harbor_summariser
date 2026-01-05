@@ -51,6 +51,20 @@ class ProjectSummary:
     repositories: List[RepositorySummary]
 
 
+@dataclass
+class HarborInstanceConfig:
+    base_url: str
+    username: Optional[str]
+    password: Optional[str]
+    api_token: Optional[str]
+
+
+@dataclass
+class HarborInstanceSummary:
+    base_url: str
+    projects: List[ProjectSummary]
+
+
 @dataclass(frozen=True)
 class ColumnDefinition:
     key: str
@@ -169,9 +183,19 @@ def parse_args() -> argparse.Namespace:
         description="Generate Harbor repository summaries in HTML, Markdown, or Confluence storage format."
     )
     parser.add_argument(
+        "-B",
+        "--instance",
+        dest="instances",
+        action="append",
+        metavar="BASE_URL[,api-token=TOKEN][,username=USER][,password=PASS]",
+        help=(
+            "Connect to an additional Harbor instance. Repeat this flag to summarize multiple Harbor instances "
+            "in a single run. Per-instance credentials override the global username/password or api-token flags."
+        ),
+    )
+    parser.add_argument(
         "-b",
         "--base-url",
-        required=True,
         help="Base URL of the Harbor instance (e.g. https://harbor.example.com).",
     )
     parser.add_argument(
@@ -264,31 +288,116 @@ def parse_args() -> argparse.Namespace:
     )
 
     args = parser.parse_args()
+    if not args.base_url and not getattr(args, "instances", None):
+        parser.error("--base-url is required unless at least one --instance is provided.")
     args.explicit_output = args.output is not None
     if args.output is None:
         args.output = DEFAULT_HTML_OUTPUT_FILENAME
     return args
 
 
-def ensure_credentials(args: argparse.Namespace) -> None:
-    """Prompt for or validate credentials based on argparse results."""
-    if args.api_token:
+def _parse_instance_spec(raw_value: str) -> HarborInstanceConfig:
+    """Parse a single --instance flag value into a HarborInstanceConfig."""
+    if not isinstance(raw_value, str) or not raw_value.strip():
+        raise SystemExit("Each --instance requires a base URL and optional credentials.")
+
+    parts = [part.strip() for part in raw_value.split(",") if part.strip()]
+    base_url: Optional[str] = None
+    values: Dict[str, str] = {}
+
+    for index, part in enumerate(parts):
+        if "=" in part:
+            key, value = part.split("=", 1)
+            key = key.strip().lower()
+            value = value.strip()
+            if not key:
+                raise SystemExit(f"Invalid --instance segment '{part}'. Expected key=value pairs.")
+            values[key] = value
+        elif index == 0 and base_url is None:
+            base_url = part
+        else:
+            raise SystemExit(
+                f"Invalid --instance segment '{part}'. Provide key=value pairs after the base URL."
+            )
+
+    base_url = values.pop("base-url", base_url)
+    api_token = values.pop("api-token", None)
+    username = values.pop("username", None)
+    password = values.pop("password", None)
+    if values:
+        unknown_keys = ", ".join(sorted(values.keys()))
+        raise SystemExit(f"Unknown --instance keys: {unknown_keys}")
+    if not base_url:
+        raise SystemExit(
+            "Each --instance must include a base URL (for example "
+            "--instance https://harbor.example.com,api-token=TOKEN)."
+        )
+
+    return HarborInstanceConfig(
+        base_url=base_url,
+        username=username,
+        password=password,
+        api_token=api_token,
+    )
+
+
+def _prepare_instances(args: argparse.Namespace) -> List[HarborInstanceConfig]:
+    """Build a list of HarborInstanceConfig objects from CLI args."""
+    instances: List[HarborInstanceConfig] = []
+    for raw_value in getattr(args, "instances", []) or []:
+        instances.append(_parse_instance_spec(raw_value))
+    if args.base_url:
+        instances.append(
+            HarborInstanceConfig(
+                base_url=args.base_url,
+                username=args.username,
+                password=args.password,
+                api_token=args.api_token,
+            )
+        )
+    if not instances:
+        raise SystemExit("Error: at least one Harbor instance must be provided.")
+    return instances
+
+
+def ensure_instance_credentials(instance: HarborInstanceConfig, defaults: argparse.Namespace) -> None:
+    """Prompt for or validate credentials for a specific Harbor instance."""
+    if instance.api_token:
         return
-    if not args.username:
-        raise SystemExit("Error: --username or --api-token is required.")
-    if args.password is None:
-        args.password = getpass.getpass("Harbor password: ")
+    if instance.username:
+        if instance.password is None:
+            instance.password = getpass.getpass(
+                f"Harbor password for {instance.username} @ {instance.base_url}: "
+            )
+            if defaults.username and instance.username == defaults.username and defaults.password is None:
+                defaults.password = instance.password
+        return
+    if defaults.api_token:
+        instance.api_token = defaults.api_token
+        return
+    if defaults.username:
+        instance.username = defaults.username
+        instance.password = defaults.password
+        if instance.password is None:
+            instance.password = getpass.getpass(
+                f"Harbor password for {instance.username} @ {instance.base_url}: "
+            )
+            defaults.password = instance.password
+        return
+    raise SystemExit(
+        f"Error: credentials required for {instance.base_url}. Provide an api-token or username/password."
+    )
 
 
-def build_session(args: argparse.Namespace) -> requests.Session:
+def build_session(instance: HarborInstanceConfig, insecure: bool) -> requests.Session:
     """Create a configured `requests.Session` for interacting with Harbor."""
     session = requests.Session()
-    session.verify = not args.insecure
+    session.verify = not insecure
     session.headers.update({"Accept": "application/json"})
-    if args.api_token:
-        session.headers["Authorization"] = f"Bearer {args.api_token}"
+    if instance.api_token:
+        session.headers["Authorization"] = f"Bearer {instance.api_token}"
     else:
-        session.auth = (args.username, args.password)
+        session.auth = (instance.username, instance.password)
     return session
 
 
@@ -343,10 +452,12 @@ def format_timestamp(value: Optional[str]) -> str:
         return value
 
 
-def build_html(projects: List[ProjectSummary], columns: List[ColumnDefinition]) -> str:
+def build_html(instances: List[HarborInstanceSummary], columns: List[ColumnDefinition]) -> str:
     """Render the collected project data as an HTML document."""
-    total_projects = len(projects)
-    total_repositories = sum(len(project.repositories) for project in projects)
+    total_projects = sum(len(instance.projects) for instance in instances)
+    total_repositories = sum(
+        len(project.repositories) for instance in instances for project in instance.projects
+    )
     timestamp = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
 
     rows: List[str] = [
@@ -369,24 +480,31 @@ def build_html(projects: List[ProjectSummary], columns: List[ColumnDefinition]) 
         "</head>",
         "<body>",
         "<h1>Harbor Repository Summary</h1>",
-        f"<p>Generated at {escape(timestamp)} · {total_projects} projects · {total_repositories} repositories.</p>",
+        (
+            f"<p>Generated at {escape(timestamp)} · {total_projects} projects · "
+            f"{total_repositories} repositories across {len(instances)} Harbor instance(s).</p>"
+        ),
     ]
 
-    for project in sorted(projects, key=lambda p: p.name.lower()):
+    for instance in sorted(instances, key=lambda inst: inst.base_url.lower()):
         rows.append("<section>")
-        rows.append(f"<h2>Project: {escape(project.name)} ({project.repo_count} repositories)</h2>")
-        if not project.repositories:
-            rows.append("<p>No repositories available.</p>")
-        else:
-            rows.append("<table>")
-            header_cells = "".join(f"<th>{escape(column.label)}</th>" for column in columns)
-            rows.append(f"<thead><tr>{header_cells}</tr></thead>")
-            rows.append("<tbody>")
-            for repo in sorted(project.repositories, key=lambda r: r.name.lower()):
-                cell_html = "".join(f"<td>{column.html_renderer(repo)}</td>" for column in columns)
-                rows.append(f"<tr>{cell_html}</tr>")
-            rows.append("</tbody>")
-            rows.append("</table>")
+        rows.append(f"<h2>Harbor: {escape(instance.base_url)}</h2>")
+        if not instance.projects:
+            rows.append("<p>No projects available.</p>")
+        for project in sorted(instance.projects, key=lambda p: p.name.lower()):
+            rows.append(f"<h3>Project: {escape(project.name)} ({project.repo_count} repositories)</h3>")
+            if not project.repositories:
+                rows.append("<p>No repositories available.</p>")
+            else:
+                rows.append("<table>")
+                header_cells = "".join(f"<th>{escape(column.label)}</th>" for column in columns)
+                rows.append(f"<thead><tr>{header_cells}</tr></thead>")
+                rows.append("<tbody>")
+                for repo in sorted(project.repositories, key=lambda r: r.name.lower()):
+                    cell_html = "".join(f"<td>{column.html_renderer(repo)}</td>" for column in columns)
+                    rows.append(f"<tr>{cell_html}</tr>")
+                rows.append("</tbody>")
+                rows.append("</table>")
         rows.append("</section>")
 
     rows.extend(
@@ -401,121 +519,153 @@ def build_html(projects: List[ProjectSummary], columns: List[ColumnDefinition]) 
     return "\n".join(rows)
 
 
-def build_markdown(projects: List[ProjectSummary], columns: List[ColumnDefinition]) -> str:
+def build_markdown(instances: List[HarborInstanceSummary], columns: List[ColumnDefinition]) -> str:
     """Render the collected project data as a Markdown document."""
-    total_projects = len(projects)
-    total_repositories = sum(len(project.repositories) for project in projects)
+    total_projects = sum(len(instance.projects) for instance in instances)
+    total_repositories = sum(
+        len(project.repositories) for instance in instances for project in instance.projects
+    )
     timestamp = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
 
     lines: List[str] = [
         "# Harbor Repository Summary",
         "",
-        f"Generated at {timestamp} · {total_projects} projects · {total_repositories} repositories.",
+        (
+            f"Generated at {timestamp} · {total_projects} projects · "
+            f"{total_repositories} repositories across {len(instances)} Harbor instance(s)."
+        ),
         "",
     ]
 
-    for project in sorted(projects, key=lambda p: p.name.lower()):
-        lines.append(f"## Project: {_escape_markdown(project.name)} ({project.repo_count} repositories)")
+    for instance in sorted(instances, key=lambda inst: inst.base_url.lower()):
+        lines.append(f"## Harbor: {_escape_markdown(instance.base_url)}")
         lines.append("")
-        if not project.repositories:
-            lines.append("_No repositories available._")
+        if not instance.projects:
+            lines.append("_No projects available._")
             lines.append("")
             continue
-        header = " | ".join(_escape_markdown(column.label) for column in columns)
-        separator = " | ".join("---" for _ in columns)
-        lines.append(f"| {header} |")
-        lines.append(f"| {separator} |")
-        for repo in sorted(project.repositories, key=lambda r: r.name.lower()):
-            row = " | ".join(column.markdown_renderer(repo) for column in columns)
-            lines.append(f"| {row} |")
-        lines.append("")
+        for project in sorted(instance.projects, key=lambda p: p.name.lower()):
+            lines.append(
+                f"### Project: {_escape_markdown(project.name)} ({project.repo_count} repositories)"
+            )
+            lines.append("")
+            if not project.repositories:
+                lines.append("_No repositories available._")
+                lines.append("")
+                continue
+            header = " | ".join(_escape_markdown(column.label) for column in columns)
+            separator = " | ".join("---" for _ in columns)
+            lines.append(f"| {header} |")
+            lines.append(f"| {separator} |")
+            for repo in sorted(project.repositories, key=lambda r: r.name.lower()):
+                row = " | ".join(column.markdown_renderer(repo) for column in columns)
+                lines.append(f"| {row} |")
+            lines.append("")
 
     lines.append("_Generated by generate_harbor_summary.py_")
     lines.append("")
     return "\n".join(lines)
 
 
-def build_confluence_storage(projects: List[ProjectSummary], columns: List[ColumnDefinition]) -> str:
+def build_confluence_storage(
+    instances: List[HarborInstanceSummary], columns: List[ColumnDefinition]
+) -> str:
     """Render the project data as Confluence storage-format (XHTML) markup."""
-    total_projects = len(projects)
-    total_repositories = sum(len(project.repositories) for project in projects)
+    total_projects = sum(len(instance.projects) for instance in instances)
+    total_repositories = sum(
+        len(project.repositories) for instance in instances for project in instance.projects
+    )
     timestamp = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
 
     parts: List[str] = [
         "<h1>Harbor Repository Summary</h1>",
-        f"<p>Generated at {escape(timestamp)} · {total_projects} projects · {total_repositories} repositories.</p>",
+        (
+            f"<p>Generated at {escape(timestamp)} · {total_projects} projects · "
+            f"{total_repositories} repositories across {len(instances)} Harbor instance(s).</p>"
+        ),
     ]
 
-    for project in sorted(projects, key=lambda p: p.name.lower()):
-        parts.append(f"<h2>Project: {escape(project.name)} ({project.repo_count} repositories)</h2>")
-        if not project.repositories:
-            parts.append("<p><em>No repositories available.</em></p>")
+    for instance in sorted(instances, key=lambda inst: inst.base_url.lower()):
+        parts.append(f"<h2>Harbor: {escape(instance.base_url)}</h2>")
+        if not instance.projects:
+            parts.append("<p><em>No projects available.</em></p>")
             continue
-        header_cells = "".join(f"<th>{escape(column.label)}</th>" for column in columns)
-        parts.append("<table>")
-        parts.append(f"<thead><tr>{header_cells}</tr></thead>")
-        parts.append("<tbody>")
-        for repo in sorted(project.repositories, key=lambda r: r.name.lower()):
-            cell_html = "".join(f"<td>{column.html_renderer(repo)}</td>" for column in columns)
-            parts.append(f"<tr>{cell_html}</tr>")
-        parts.append("</tbody>")
-        parts.append("</table>")
+        for project in sorted(instance.projects, key=lambda p: p.name.lower()):
+            parts.append(f"<h3>Project: {escape(project.name)} ({project.repo_count} repositories)</h3>")
+            if not project.repositories:
+                parts.append("<p><em>No repositories available.</em></p>")
+                continue
+            header_cells = "".join(f"<th>{escape(column.label)}</th>" for column in columns)
+            parts.append("<table>")
+            parts.append(f"<thead><tr>{header_cells}</tr></thead>")
+            parts.append("<tbody>")
+            for repo in sorted(project.repositories, key=lambda r: r.name.lower()):
+                cell_html = "".join(f"<td>{column.html_renderer(repo)}</td>" for column in columns)
+                parts.append(f"<tr>{cell_html}</tr>")
+            parts.append("</tbody>")
+            parts.append("</table>")
 
     parts.append("<p><em>Generated by generate_harbor_summary.py.</em></p>")
     return "\n".join(parts)
 
 
-def collect_data(args: argparse.Namespace) -> List[ProjectSummary]:
-    """Fetch projects and repositories from Harbor, applying any filters."""
-    ensure_credentials(args)
-    session = build_session(args)
-    timeout = args.timeout
-    projects: List[ProjectSummary] = []
+def collect_data(args: argparse.Namespace) -> List[HarborInstanceSummary]:
+    """Fetch projects and repositories from one or more Harbor instances."""
+    instances = _prepare_instances(args)
     project_filters, filter_lookup = _prepare_project_filters(getattr(args, "projects", None))
     remaining_filters = set(project_filters) if project_filters else set()
 
-    for project in fetch_paginated(
-        session,
-        args.base_url,
-        "/api/v2.0/projects",
-        page_size=args.page_size,
-        timeout=timeout,
-    ):
-        name = str(project.get("name", ""))
-        if not name:
-            continue
-        normalized_name = name.lower()
-        if project_filters and normalized_name not in project_filters:
-            # Skip projects outside the requested subset.
-            continue
-        remaining_filters.discard(normalized_name)
-        repo_count = int(project.get("repo_count", 0) or 0)
-        repositories: List[RepositorySummary] = []
-        for repo in fetch_paginated(
+    all_projects: List[HarborInstanceSummary] = []
+
+    for instance in instances:
+        ensure_instance_credentials(instance, args)
+        session = build_session(instance, insecure=args.insecure)
+        timeout = args.timeout
+        projects: List[ProjectSummary] = []
+
+        for project in fetch_paginated(
             session,
-            args.base_url,
-            f"/api/v2.0/projects/{name}/repositories",
+            instance.base_url,
+            "/api/v2.0/projects",
             page_size=args.page_size,
             timeout=timeout,
-            extra_headers={"X-Is-Resource-Name": "true"},
         ):
-            repositories.append(
-                RepositorySummary(
-                    name=str(repo.get("name", "")),
-                    project_name=name,
-                    pull_count=_safe_int(repo.get("pull_count")),
-                    artifact_count=_safe_int(repo.get("artifact_count")),
-                    update_time=repo.get("update_time"),
-                    description=repo.get("description"),
+            name = str(project.get("name", ""))
+            if not name:
+                continue
+            normalized_name = name.lower()
+            if project_filters and normalized_name not in project_filters:
+                # Skip projects outside the requested subset.
+                continue
+            remaining_filters.discard(normalized_name)
+            repo_count = int(project.get("repo_count", 0) or 0)
+            repositories: List[RepositorySummary] = []
+            for repo in fetch_paginated(
+                session,
+                instance.base_url,
+                f"/api/v2.0/projects/{name}/repositories",
+                page_size=args.page_size,
+                timeout=timeout,
+                extra_headers={"X-Is-Resource-Name": "true"},
+            ):
+                repositories.append(
+                    RepositorySummary(
+                        name=str(repo.get("name", "")),
+                        project_name=name,
+                        pull_count=_safe_int(repo.get("pull_count")),
+                        artifact_count=_safe_int(repo.get("artifact_count")),
+                        update_time=repo.get("update_time"),
+                        description=repo.get("description"),
+                    )
                 )
-            )
-        projects.append(ProjectSummary(name=name, repo_count=repo_count, repositories=repositories))
+            projects.append(ProjectSummary(name=name, repo_count=repo_count, repositories=repositories))
+        all_projects.append(HarborInstanceSummary(base_url=instance.base_url, projects=projects))
 
     if remaining_filters:
         missing = ", ".join(sorted(filter_lookup[key] for key in remaining_filters))
         print(f"Warning: requested projects not found: {missing}", file=sys.stderr)
 
-    return projects
+    return all_projects
 
 
 def _safe_int(value: Any) -> Optional[int]:
@@ -599,38 +749,47 @@ def _prepare_project_filters(
 
 def _list_projects(args: argparse.Namespace) -> None:
     """List Harbor projects (with repo counts) to stdout or an optional file."""
-    ensure_credentials(args)
-    session = build_session(args)
+    instances = _prepare_instances(args)
     project_filters, filter_lookup = _prepare_project_filters(getattr(args, "projects", None))
     remaining_filters = set(project_filters) if project_filters else set()
 
-    projects: List[Tuple[str, int]] = []
-    for project in fetch_paginated(
-        session,
-        args.base_url,
-        "/api/v2.0/projects",
-        page_size=args.page_size,
-        timeout=args.timeout,
-    ):
-        name = str(project.get("name", ""))
-        if not name:
-            continue
-        normalized_name = name.lower()
-        if project_filters and normalized_name not in project_filters:
-            continue
-        remaining_filters.discard(normalized_name)
-        repo_count = int(project.get("repo_count", 0) or 0)
-        projects.append((name, repo_count))
+    sections: List[str] = []
+
+    for instance in instances:
+        ensure_instance_credentials(instance, args)
+        session = build_session(instance, insecure=args.insecure)
+
+        projects: List[Tuple[str, int]] = []
+        for project in fetch_paginated(
+            session,
+            instance.base_url,
+            "/api/v2.0/projects",
+            page_size=args.page_size,
+            timeout=args.timeout,
+        ):
+            name = str(project.get("name", ""))
+            if not name:
+                continue
+            normalized_name = name.lower()
+            if project_filters and normalized_name not in project_filters:
+                continue
+            remaining_filters.discard(normalized_name)
+            repo_count = int(project.get("repo_count", 0) or 0)
+            projects.append((name, repo_count))
+
+        header = f"Harbor: {instance.base_url}"
+        if not projects:
+            sections.append(f"{header}\nNo projects found.")
+        else:
+            projects.sort(key=lambda item: item[0].lower())
+            project_lines = "\n".join(f"{name} ({count} repositories)" for name, count in projects)
+            sections.append(f"{header}\n{project_lines}")
 
     if remaining_filters:
         missing = ", ".join(sorted(filter_lookup[key] for key in remaining_filters))
         print(f"Warning: requested projects not found: {missing}", file=sys.stderr)
 
-    if not projects:
-        output_text = "No projects found."
-    else:
-        projects.sort(key=lambda item: item[0].lower())
-        output_text = "\n".join(f"{name} ({count} repositories)" for name, count in projects)
+    output_text = "\n\n".join(sections) if sections else "No projects found."
 
     if getattr(args, "explicit_output", False):
         output_path = Path(args.output)
@@ -670,7 +829,7 @@ def main() -> None:
             args.output = DEFAULT_HTML_OUTPUT_FILENAME
     columns = _prepare_columns(getattr(args, "columns", None))
     try:
-        projects = collect_data(args)
+        instances = collect_data(args)
     except requests.HTTPError as exc:
         response = exc.response
         details = f"[{response.status_code}] {response.text}" if response is not None else str(exc)
@@ -679,13 +838,13 @@ def main() -> None:
         raise SystemExit(f"Network error while contacting Harbor: {exc}") from exc
 
     if output_format == "markdown":
-        summary = build_markdown(projects, columns)
+        summary = build_markdown(instances, columns)
         label = "Markdown"
     elif output_format == "confluence":
-        summary = build_confluence_storage(projects, columns)
+        summary = build_confluence_storage(instances, columns)
         label = "Confluence storage"
     else:
-        summary = build_html(projects, columns)
+        summary = build_html(instances, columns)
         label = "HTML"
     output_path = Path(args.output)
     output_path.write_text(summary, encoding="utf-8")

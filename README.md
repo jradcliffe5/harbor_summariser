@@ -15,7 +15,17 @@ python3 generate_harbor_summary.py \
   --username my-user --output harbor_summary.html
 ```
 
-Short aliases are available for quicker invocations (for example `-b` for `--base-url`, `-o` for `--output`, `-P` for `--project`, and `-c` for `--column`).
+To summarize multiple Harbor instances in a single run, repeat `--instance` with a base URL and credentials for each registry:
+
+```bash
+python3 generate_harbor_summary.py \
+  --instance https://harbor-one.example.com,api-token="$HARBOR_TOKEN_ONE" \
+  --instance base-url=https://harbor-two.example.com,api-token="$HARBOR_TOKEN_TWO" \
+  --format markdown --output multi_harbor.md
+```
+Per-instance credentials take precedence; when omitted, the script falls back to the global `--api-token` or `--username`/`--password` flags.
+
+Short aliases are available for quicker invocations (for example `-B` for `--instance`, `-b` for `--base-url`, `-o` for `--output`, `-P` for `--project`, and `-c` for `--column`).
 
 If you omit `--password`, the script securely prompts for it. You can also provide a robot or user API token via `--api-token` instead of username/password. The script writes the summary to the path passed with `--output` (defaults to `harbor_summary.html` for HTML, `harbor_summary.md` for Markdown, or `harbor_summary_confluence.xml` for Confluence storage format).
 
@@ -61,7 +71,8 @@ To connect to Harbor instances with self-signed certificates, add `--insecure` t
 
 | Flag(s) | Description | Default |
 | ------- | ----------- | ------- |
-| `-b`, `--base-url` | Base URL of the Harbor instance. | Required |
+| `-B`, `--instance` | Add a Harbor instance in the form `BASE_URL[,api-token=TOKEN][,username=USER][,password=PASS]` (repeatable). | None |
+| `-b`, `--base-url` | Base URL of the Harbor instance (required unless `--instance` is used). | None |
 | `-u`, `--username` | Harbor username (prompted for password unless `--password` is supplied). | None |
 | `-p`, `--password` | Harbor password to pair with `--username`. | Prompted when omitted |
 | `-t`, `--api-token` | Harbor robot or user API token (overrides username/password). | None |
