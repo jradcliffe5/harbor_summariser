@@ -68,6 +68,7 @@ class HarborInstanceConfig:
     username: Optional[str]
     password: Optional[str]
     api_token: Optional[str]
+    projects: Optional[List[str]] = None
 
 
 @dataclass
@@ -77,6 +78,7 @@ class HarborInstanceSummary:
     username: Optional[str] = None
     password: Optional[str] = None
     api_token: Optional[str] = None
+    project_filters: Optional[List[str]] = None
 
 
 @dataclass(frozen=True)
@@ -337,6 +339,7 @@ def _parse_instance_spec(raw_value: str) -> HarborInstanceConfig:
     parts = [part.strip() for part in raw_value.split(",") if part.strip()]
     base_url: Optional[str] = None
     values: Dict[str, str] = {}
+    projects: List[str] = []
 
     for index, part in enumerate(parts):
         if "=" in part:
@@ -345,6 +348,13 @@ def _parse_instance_spec(raw_value: str) -> HarborInstanceConfig:
             value = value.strip()
             if not key:
                 raise SystemExit(f"Invalid --instance segment '{part}'. Expected key=value pairs.")
+            if key in {"project", "projects"}:
+                tokens = [token.strip() for token in re.split(r"[|;]", value) if token.strip()]
+                if tokens:
+                    projects.extend(tokens)
+                else:
+                    projects.append(value) if value else None
+                continue
             values[key] = value
         elif index == 0 and base_url is None:
             base_url = part
@@ -371,6 +381,7 @@ def _parse_instance_spec(raw_value: str) -> HarborInstanceConfig:
         username=username,
         password=password,
         api_token=api_token,
+        projects=projects or None,
     )
 
 
@@ -386,6 +397,7 @@ def _prepare_instances(args: argparse.Namespace) -> List[HarborInstanceConfig]:
                 username=args.username,
                 password=args.password,
                 api_token=args.api_token,
+                projects=None,
             )
         )
     if not instances:
@@ -683,13 +695,17 @@ def build_confluence_storage(
 def collect_data(args: argparse.Namespace) -> List[HarborInstanceSummary]:
     """Fetch projects and repositories from one or more Harbor instances."""
     instances = _prepare_instances(args)
-    project_filters, filter_lookup = _prepare_project_filters(getattr(args, "projects", None))
-    remaining_filters = set(project_filters) if project_filters else set()
+    global_filters, global_lookup = _prepare_project_filters(getattr(args, "projects", None))
     collect_artifacts = bool(getattr(args, "pull_dir", None))
 
     all_projects: List[HarborInstanceSummary] = []
 
     for instance in instances:
+        instance_filters, instance_lookup = _prepare_project_filters(instance.projects)
+        effective_filters = instance_filters if instance_filters is not None else global_filters
+        effective_lookup = instance_lookup if instance_lookup else global_lookup
+        remaining_filters = set(effective_filters) if effective_filters else set()
+
         ensure_instance_credentials(instance, args)
         session = build_session(instance, insecure=args.insecure)
         timeout = args.timeout
@@ -706,7 +722,7 @@ def collect_data(args: argparse.Namespace) -> List[HarborInstanceSummary]:
             if not name:
                 continue
             normalized_name = name.lower()
-            if project_filters and normalized_name not in project_filters:
+            if effective_filters and normalized_name not in effective_filters:
                 # Skip projects outside the requested subset.
                 continue
             remaining_filters.discard(normalized_name)
@@ -743,6 +759,9 @@ def collect_data(args: argparse.Namespace) -> List[HarborInstanceSummary]:
                     )
                 )
             projects.append(ProjectSummary(name=name, repo_count=repo_count, repositories=repositories))
+        if remaining_filters:
+            missing = ", ".join(sorted(effective_lookup[key] for key in remaining_filters))
+            print(f"Warning: requested projects not found in {instance.base_url}: {missing}", file=sys.stderr)
         all_projects.append(
             HarborInstanceSummary(
                 base_url=instance.base_url,
@@ -750,12 +769,9 @@ def collect_data(args: argparse.Namespace) -> List[HarborInstanceSummary]:
                 username=instance.username,
                 password=instance.password,
                 api_token=instance.api_token,
+                project_filters=instance.projects,
             )
         )
-
-    if remaining_filters:
-        missing = ", ".join(sorted(filter_lookup[key] for key in remaining_filters))
-        print(f"Warning: requested projects not found: {missing}", file=sys.stderr)
 
     return all_projects
 
@@ -926,12 +942,16 @@ def _prepare_project_filters(
 def _list_projects(args: argparse.Namespace) -> None:
     """List Harbor projects (with repo counts) to stdout or an optional file."""
     instances = _prepare_instances(args)
-    project_filters, filter_lookup = _prepare_project_filters(getattr(args, "projects", None))
-    remaining_filters = set(project_filters) if project_filters else set()
+    global_filters, global_lookup = _prepare_project_filters(getattr(args, "projects", None))
 
     sections: List[str] = []
 
     for instance in instances:
+        instance_filters, instance_lookup = _prepare_project_filters(instance.projects)
+        effective_filters = instance_filters if instance_filters is not None else global_filters
+        effective_lookup = instance_lookup if instance_lookup else global_lookup
+        remaining_filters = set(effective_filters) if effective_filters else set()
+
         ensure_instance_credentials(instance, args)
         session = build_session(instance, insecure=args.insecure)
 
@@ -947,7 +967,7 @@ def _list_projects(args: argparse.Namespace) -> None:
             if not name:
                 continue
             normalized_name = name.lower()
-            if project_filters and normalized_name not in project_filters:
+            if effective_filters and normalized_name not in effective_filters:
                 continue
             remaining_filters.discard(normalized_name)
             repo_count = int(project.get("repo_count", 0) or 0)
@@ -961,9 +981,9 @@ def _list_projects(args: argparse.Namespace) -> None:
             project_lines = "\n".join(f"{name} ({count} repositories)" for name, count in projects)
             sections.append(f"{header}\n{project_lines}")
 
-    if remaining_filters:
-        missing = ", ".join(sorted(filter_lookup[key] for key in remaining_filters))
-        print(f"Warning: requested projects not found: {missing}", file=sys.stderr)
+        if remaining_filters:
+            missing = ", ".join(sorted(effective_lookup[key] for key in remaining_filters))
+            print(f"Warning: requested projects not found in {instance.base_url}: {missing}", file=sys.stderr)
 
     output_text = "\n\n".join(sections) if sections else "No projects found."
 

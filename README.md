@@ -20,11 +20,12 @@ To summarize multiple Harbor instances in a single run, repeat `--instance` with
 
 ```bash
 python3 generate_harbor_summary.py \
-  --instance https://harbor-one.example.com,api-token="$HARBOR_TOKEN_ONE" \
-  --instance base-url=https://harbor-two.example.com,api-token="$HARBOR_TOKEN_TWO" \
+  --instance https://harbor-one.example.com,api-token="$HARBOR_TOKEN_ONE",project=lib-one \
+  --instance base-url=https://harbor-two.example.com,api-token="$HARBOR_TOKEN_TWO",project=lib-two,project=charts \
   --format markdown --output multi_harbor.md
 ```
 Per-instance credentials take precedence; when omitted, the script falls back to the global `--api-token` or `--username`/`--password` flags.
+You can also scope projects per Harbor instance with `project=` (repeatable) when project names differ between registries.
 
 To download every summarised repository as Singularity/Apptainer images, add `--pull-dir` to choose a destination directory (uses the `oras` transport by default):
 
@@ -81,7 +82,7 @@ To connect to Harbor instances with self-signed certificates, add `--insecure` t
 
 | Flag(s) | Description | Default |
 | ------- | ----------- | ------- |
-| `-B`, `--instance` | Add a Harbor instance in the form `BASE_URL[,api-token=TOKEN][,username=USER][,password=PASS]` (repeatable). | None |
+| `-B`, `--instance` | Add a Harbor instance in the form `BASE_URL[,api-token=TOKEN][,username=USER][,password=PASS][,project=NAME...]` (repeatable). | None |
 | `-b`, `--base-url` | Base URL of the Harbor instance (required unless `--instance` is used). | None |
 | `-u`, `--username` | Harbor username (prompted for password unless `--password` is supplied). | None |
 | `-p`, `--password` | Harbor password to pair with `--username`. | Prompted when omitted |
