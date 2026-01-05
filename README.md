@@ -32,7 +32,8 @@ To download every summarised repository as Singularity/Apptainer images, add `--
 ```bash
 python3 generate_harbor_summary.py \
   --instance https://harbor.example.com,username=robot$user,api-token="$HARBOR_TOKEN" \
-  --pull-dir ./pulled_images --pull-transport oras --singularity-bin apptainer
+  --pull-dir ./pulled_images --pull-transport oras --pull-fallback \
+  --pull-overwrite --singularity-bin apptainer
 ```
 Provide a username along with your token when pulls require authentication.
 
@@ -91,6 +92,8 @@ To connect to Harbor instances with self-signed certificates, add `--insecure` t
 | `-o`, `--output` | File path for the generated summary or project list. | `harbor_summary.html` (HTML) / `harbor_summary.md` (Markdown) / `harbor_summary_confluence.xml` (Confluence storage) |
 | `--pull-dir` | Directory where Singularity/Apptainer pulls of all summarised repositories are saved as `.sif`. | None |
 | `--pull-transport` | Transport for pulls (`oras` or `docker`). | `oras` |
+| `--pull-fallback` | Retry failed pulls with the opposite transport (oras↔docker). | Disabled |
+| `--pull-overwrite` | Overwrite existing pulled `.sif` files instead of skipping them. | Disabled |
 | `--singularity-bin` | Singularity/Apptainer executable to run for pulls. | `singularity` |
 | `-f`, `--format` | Force `html`, `markdown`, or `confluence` output. | Auto-detect from `--output` suffix (`.md`/`.markdown` → Markdown, `.xml`/`.confluence` → Confluence, otherwise HTML) |
 | `-s`, `--page-size` | Page size for Harbor API pagination. | `100` |

@@ -263,6 +263,16 @@ def parse_args() -> argparse.Namespace:
         help="Transport to use when pulling images (oras is recommended for SIF stored in Harbor).",
     )
     parser.add_argument(
+        "--pull-fallback",
+        action="store_true",
+        help="Retry failed pulls with the opposite transport (oras↔docker).",
+    )
+    parser.add_argument(
+        "--pull-overwrite",
+        action="store_true",
+        help="Overwrite existing pulled images instead of skipping them.",
+    )
+    parser.add_argument(
         "--singularity-bin",
         default="singularity",
         help="Executable to use for pulling images (e.g. singularity or apptainer).",
@@ -809,6 +819,8 @@ def pull_singularity_images(
     pull_dir: str,
     transport: str,
     singularity_bin: str,
+    overwrite: bool,
+    fallback_opposite: bool,
 ) -> None:
     """Pull all discovered artifacts as Singularity/Apptainer images into a directory."""
     if not pull_dir:
@@ -858,16 +870,43 @@ def pull_singularity_images(
                             continue
                         seen_refs.add(reference)
 
-                        uri = f"{transport}://{registry_host}/{reference}"
                         filename_label = _sanitize_for_fs(label or "image", "image")
                         outfile = project_dir / f"{_sanitize_for_fs(repo_leaf or repo.name, 'repository')}-{filename_label}.sif"
-                        cmd = [binary_path, "pull", "--disable-cache", str(outfile), uri]
-                        result = subprocess.run(cmd, capture_output=True, text=True, env=env)
-                        if result.returncode != 0:
-                            message = result.stderr.strip() or result.stdout.strip()
-                            print(f"Failed to pull {uri}: {message}", file=sys.stderr)
-                        else:
+                        if outfile.exists() and not overwrite:
+                            print(f"Skipping existing image {outfile}")
+                            continue
+
+                        primary_transport = transport
+                        fallback_transport = "docker" if primary_transport == "oras" else "oras"
+                        attempted_fallback = False
+
+                        def run_pull(selected_transport: str) -> bool:
+                            uri = f"{selected_transport}://{registry_host}/{reference}"
+                            cmd = [binary_path, "pull", "--disable-cache"]
+                            if overwrite:
+                                cmd.append("--force")
+                            cmd.extend([str(outfile), uri])
+                            result = subprocess.run(cmd, capture_output=True, text=True, env=env)
+                            if result.returncode != 0:
+                                message = result.stderr.strip() or result.stdout.strip()
+                                print(f"Failed to pull {uri}: {message}", file=sys.stderr)
+                                return False
                             print(f"Pulled {uri} -> {outfile}")
+                            return True
+
+                        success = run_pull(primary_transport)
+                        if (
+                            not success
+                            and fallback_opposite
+                            and fallback_transport != primary_transport
+                        ):
+                            attempted_fallback = True
+                            success = run_pull(fallback_transport)
+                        if not success and attempted_fallback:
+                            print(
+                                f"Fallback to {fallback_transport} also failed for {reference} from {registry_host}.",
+                                file=sys.stderr,
+                            )
 
 
 def _escape_markdown(value: Any) -> str:
@@ -1039,6 +1078,8 @@ def main() -> None:
             pull_dir=args.pull_dir,
             transport=args.pull_transport,
             singularity_bin=args.singularity_bin,
+            overwrite=getattr(args, "pull_overwrite", False),
+            fallback_opposite=getattr(args, "pull_fallback", False),
         )
 
     if output_format == "markdown":
