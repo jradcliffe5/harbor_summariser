@@ -6,6 +6,7 @@ This repository contains a standalone Python script that connects to a Harbor in
 
 - Python 3.8+  
 - `requests` (`pip install requests`)
+- `singularity` / `apptainer` (optional; only needed when using `--pull-dir` to pull images)
 
 ### Usage
 
@@ -24,6 +25,15 @@ python3 generate_harbor_summary.py \
   --format markdown --output multi_harbor.md
 ```
 Per-instance credentials take precedence; when omitted, the script falls back to the global `--api-token` or `--username`/`--password` flags.
+
+To download every summarised repository as Singularity/Apptainer images, add `--pull-dir` to choose a destination directory (uses the `oras` transport by default):
+
+```bash
+python3 generate_harbor_summary.py \
+  --instance https://harbor.example.com,username=robot$user,api-token="$HARBOR_TOKEN" \
+  --pull-dir ./pulled_images --pull-transport oras --singularity-bin apptainer
+```
+Provide a username along with your token when pulls require authentication.
 
 Short aliases are available for quicker invocations (for example `-B` for `--instance`, `-b` for `--base-url`, `-o` for `--output`, `-P` for `--project`, and `-c` for `--column`).
 
@@ -78,6 +88,9 @@ To connect to Harbor instances with self-signed certificates, add `--insecure` t
 | `-t`, `--api-token` | Harbor robot or user API token (overrides username/password). | None |
 | `-k`, `--insecure` | Disable TLS verification (not recommended). | Disabled |
 | `-o`, `--output` | File path for the generated summary or project list. | `harbor_summary.html` (HTML) / `harbor_summary.md` (Markdown) / `harbor_summary_confluence.xml` (Confluence storage) |
+| `--pull-dir` | Directory where Singularity/Apptainer pulls of all summarised repositories are saved as `.sif`. | None |
+| `--pull-transport` | Transport for pulls (`oras` or `docker`). | `oras` |
+| `--singularity-bin` | Singularity/Apptainer executable to run for pulls. | `singularity` |
 | `-f`, `--format` | Force `html`, `markdown`, or `confluence` output. | Auto-detect from `--output` suffix (`.md`/`.markdown` → Markdown, `.xml`/`.confluence` → Confluence, otherwise HTML) |
 | `-s`, `--page-size` | Page size for Harbor API pagination. | `100` |
 | `-T`, `--timeout` | HTTP request timeout in seconds. | `30` |

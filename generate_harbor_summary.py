@@ -13,13 +13,17 @@ from __future__ import annotations
 import argparse
 import getpass
 import json
+import os
+import re
+import shutil
+import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from html import escape
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Set, Tuple
-from urllib.parse import urljoin
+from urllib.parse import quote, urljoin, urlparse
 
 import requests
 
@@ -35,6 +39,12 @@ DEFAULT_CONFLUENCE_OUTPUT_FILENAME = "harbor_summary_confluence.xml"
 
 
 @dataclass
+class ArtifactSummary:
+    digest: Optional[str]
+    tags: List[str]
+
+
+@dataclass
 class RepositorySummary:
     name: str
     project_name: str
@@ -42,6 +52,7 @@ class RepositorySummary:
     artifact_count: Optional[int]
     update_time: Optional[str]
     description: Optional[str]
+    artifacts: List[ArtifactSummary] = field(default_factory=list)
 
 
 @dataclass
@@ -231,6 +242,25 @@ def parse_args() -> argparse.Namespace:
             "harbor_summary.md when --format markdown, or harbor_summary_confluence.xml when "
             "--format confluence)."
         ),
+    )
+    parser.add_argument(
+        "--pull-dir",
+        metavar="DIR",
+        help=(
+            "Optional directory where Singularity/Apptainer pulls of all summarised repositories will be saved "
+            "as .sif files."
+        ),
+    )
+    parser.add_argument(
+        "--pull-transport",
+        choices=("oras", "docker"),
+        default="oras",
+        help="Transport to use when pulling images (oras is recommended for SIF stored in Harbor).",
+    )
+    parser.add_argument(
+        "--singularity-bin",
+        default="singularity",
+        help="Executable to use for pulling images (e.g. singularity or apptainer).",
     )
     parser.add_argument(
         "-f",
@@ -440,6 +470,44 @@ def fetch_paginated(
         page += 1
 
 
+def _strip_project_prefix(repo_name: str, project_name: str) -> str:
+    """Remove the leading project prefix from a repository path when present."""
+    prefix = f"{project_name}/"
+    if repo_name.startswith(prefix):
+        return repo_name[len(prefix) :]
+    return repo_name
+
+
+def _fetch_artifacts_for_repository(
+    session: requests.Session,
+    base_url: str,
+    project_name: str,
+    repository_name: str,
+    *,
+    page_size: int,
+    timeout: float,
+) -> List[ArtifactSummary]:
+    """Fetch all artifacts (with tags) for a specific repository."""
+    artifacts: List[ArtifactSummary] = []
+    repository_segment = quote(_strip_project_prefix(repository_name, project_name), safe="")
+    for artifact in fetch_paginated(
+        session,
+        base_url,
+        f"/api/v2.0/projects/{project_name}/repositories/{repository_segment}/artifacts",
+        page_size=page_size,
+        timeout=timeout,
+        extra_headers={"X-Is-Resource-Name": "true"},
+    ):
+        tags: List[str] = []
+        for tag in artifact.get("tags") or []:
+            tag_name = tag.get("name")
+            if tag_name:
+                tags.append(str(tag_name))
+        digest = artifact.get("digest")
+        artifacts.append(ArtifactSummary(digest=str(digest) if digest else None, tags=tags))
+    return artifacts
+
+
 def format_timestamp(value: Optional[str]) -> str:
     """Convert an ISO timestamp to a human-readable UTC string."""
     if not value:
@@ -614,6 +682,7 @@ def collect_data(args: argparse.Namespace) -> List[HarborInstanceSummary]:
     instances = _prepare_instances(args)
     project_filters, filter_lookup = _prepare_project_filters(getattr(args, "projects", None))
     remaining_filters = set(project_filters) if project_filters else set()
+    collect_artifacts = bool(getattr(args, "pull_dir", None))
 
     all_projects: List[HarborInstanceSummary] = []
 
@@ -648,14 +717,26 @@ def collect_data(args: argparse.Namespace) -> List[HarborInstanceSummary]:
                 timeout=timeout,
                 extra_headers={"X-Is-Resource-Name": "true"},
             ):
+                artifacts: List[ArtifactSummary] = []
+                repo_name = str(repo.get("name", ""))
+                if collect_artifacts and repo_name:
+                    artifacts = _fetch_artifacts_for_repository(
+                        session,
+                        instance.base_url,
+                        project_name=name,
+                        repository_name=repo_name,
+                        page_size=args.page_size,
+                        timeout=timeout,
+                    )
                 repositories.append(
                     RepositorySummary(
-                        name=str(repo.get("name", "")),
+                        name=repo_name,
                         project_name=name,
                         pull_count=_safe_int(repo.get("pull_count")),
                         artifact_count=_safe_int(repo.get("artifact_count")),
                         update_time=repo.get("update_time"),
                         description=repo.get("description"),
+                        artifacts=artifacts,
                     )
                 )
             projects.append(ProjectSummary(name=name, repo_count=repo_count, repositories=repositories))
@@ -676,6 +757,93 @@ def _safe_int(value: Any) -> Optional[int]:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _sanitize_for_fs(value: str, fallback: str = "item") -> str:
+    """Sanitize a string so it is safe to use as a filename or directory."""
+    cleaned = re.sub(r'[\\/:*?"<>|]+', "_", str(value)).strip()
+    cleaned = cleaned.replace("@", "_").replace(" ", "_")
+    return cleaned or fallback
+
+
+def _registry_host_from_base_url(base_url: str) -> str:
+    """Extract the registry host (and optional port) from a Harbor base URL."""
+    parsed = urlparse(base_url)
+    if parsed.scheme:
+        host = parsed.netloc or parsed.path
+    else:
+        host = base_url
+    return host.rstrip("/")
+
+
+def pull_singularity_images(
+    instances: List[HarborInstanceSummary],
+    *,
+    pull_dir: str,
+    transport: str,
+    singularity_bin: str,
+) -> None:
+    """Pull all discovered artifacts as Singularity/Apptainer images into a directory."""
+    if not pull_dir:
+        return
+
+    binary_path = shutil.which(singularity_bin)
+    if binary_path is None:
+        raise SystemExit(
+            f"Unable to find '{singularity_bin}'. Install Singularity/Apptainer or set --singularity-bin."
+        )
+
+    destination_root = Path(pull_dir)
+    destination_root.mkdir(parents=True, exist_ok=True)
+    base_env = os.environ.copy()
+
+    for instance in instances:
+        registry_host = _registry_host_from_base_url(instance.base_url)
+        if not registry_host:
+            registry_host = _sanitize_for_fs(instance.base_url, "harbor")
+        instance_dir = destination_root / _sanitize_for_fs(registry_host, "harbor")
+        instance_dir.mkdir(parents=True, exist_ok=True)
+
+        env = base_env.copy()
+        if instance.username and (instance.password or instance.api_token):
+            env["SINGULARITY_DOCKER_USERNAME"] = instance.username
+            env["SINGULARITY_DOCKER_PASSWORD"] = instance.password or instance.api_token or ""
+
+        for project in instance.projects:
+            project_dir = instance_dir / _sanitize_for_fs(project.name, "project")
+            project_dir.mkdir(parents=True, exist_ok=True)
+            for repo in project.repositories:
+                repo_leaf = _strip_project_prefix(repo.name, project.name)
+                repo_dir = project_dir / _sanitize_for_fs(repo_leaf or repo.name, "repository")
+                repo_dir.mkdir(parents=True, exist_ok=True)
+
+                if not repo.artifacts:
+                    print(f"Skipping pull for {repo.name}: no artifacts discovered.")
+                    continue
+
+                seen_refs: Set[str] = set()
+                for artifact in repo.artifacts:
+                    candidates: List[Tuple[str, str]] = []
+                    if artifact.tags:
+                        candidates.extend((f"{repo.name}:{tag}", tag) for tag in artifact.tags if tag)
+                    if not candidates and artifact.digest:
+                        candidates.append((f"{repo.name}@{artifact.digest}", artifact.digest))
+
+                    for reference, label in candidates:
+                        if reference in seen_refs:
+                            continue
+                        seen_refs.add(reference)
+
+                        uri = f"{transport}://{registry_host}/{reference}"
+                        filename_label = _sanitize_for_fs(label or "image", "image")
+                        outfile = repo_dir / f"{_sanitize_for_fs(repo_leaf or repo.name, 'repository')}-{filename_label}.sif"
+                        cmd = [binary_path, "pull", "--disable-cache", str(outfile), uri]
+                        result = subprocess.run(cmd, capture_output=True, text=True, env=env)
+                        if result.returncode != 0:
+                            message = result.stderr.strip() or result.stdout.strip()
+                            print(f"Failed to pull {uri}: {message}", file=sys.stderr)
+                        else:
+                            print(f"Pulled {uri} -> {outfile}")
 
 
 def _escape_markdown(value: Any) -> str:
@@ -836,6 +1004,14 @@ def main() -> None:
         raise SystemExit(f"Harbor API error: {details}")
     except requests.RequestException as exc:
         raise SystemExit(f"Network error while contacting Harbor: {exc}") from exc
+
+    if getattr(args, "pull_dir", None):
+        pull_singularity_images(
+            instances,
+            pull_dir=args.pull_dir,
+            transport=args.pull_transport,
+            singularity_bin=args.singularity_bin,
+        )
 
     if output_format == "markdown":
         summary = build_markdown(instances, columns)
