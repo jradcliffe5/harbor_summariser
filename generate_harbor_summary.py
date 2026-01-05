@@ -74,6 +74,9 @@ class HarborInstanceConfig:
 class HarborInstanceSummary:
     base_url: str
     projects: List[ProjectSummary]
+    username: Optional[str] = None
+    password: Optional[str] = None
+    api_token: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -740,7 +743,15 @@ def collect_data(args: argparse.Namespace) -> List[HarborInstanceSummary]:
                     )
                 )
             projects.append(ProjectSummary(name=name, repo_count=repo_count, repositories=repositories))
-        all_projects.append(HarborInstanceSummary(base_url=instance.base_url, projects=projects))
+        all_projects.append(
+            HarborInstanceSummary(
+                base_url=instance.base_url,
+                projects=projects,
+                username=instance.username,
+                password=instance.password,
+                api_token=instance.api_token,
+            )
+        )
 
     if remaining_filters:
         missing = ", ".join(sorted(filter_lookup[key] for key in remaining_filters))
