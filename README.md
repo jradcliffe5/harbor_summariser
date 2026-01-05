@@ -1,6 +1,6 @@
 ## Harbor Repository Summariser
 
-This repository contains a standalone Python script that connects to a Harbor instance and builds an HTML or Markdown summary of every repository in a Harbor instance.
+This repository contains a standalone Python script that connects to a Harbor instance and builds an HTML, Markdown, or Confluence storage-format summary of every repository in a Harbor instance.
 
 ### Requirements
 
@@ -17,7 +17,7 @@ python3 generate_harbor_summary.py \
 
 Short aliases are available for quicker invocations (for example `-b` for `--base-url`, `-o` for `--output`, `-P` for `--project`, and `-c` for `--column`).
 
-If you omit `--password`, the script securely prompts for it. You can also provide a robot or user API token via `--api-token` instead of username/password. The script writes the summary to the path passed with `--output` (defaults to `harbor_summary.html` for HTML or `harbor_summary.md` for Markdown).
+If you omit `--password`, the script securely prompts for it. You can also provide a robot or user API token via `--api-token` instead of username/password. The script writes the summary to the path passed with `--output` (defaults to `harbor_summary.html` for HTML, `harbor_summary.md` for Markdown, or `harbor_summary_confluence.xml` for Confluence storage format).
 
 To focus on specific projects, pass one or more `--project` flags (comma-separated values are accepted):
 
@@ -48,6 +48,13 @@ python3 generate_harbor_summary.py --base-url https://harbor.example.com \
   --username my-user --output harbor_summary.md
 ```
 
+For a Confluence storage-format summary (suitable for pasting into the Confluence source editor or sending as `storage` content via the Confluence REST API), point `--output` to `.xml`/`.confluence` or pass `--format confluence`:
+
+```bash
+python3 generate_harbor_summary.py --base-url https://harbor.example.com \
+  --api-token "$HARBOR_TOKEN" --format confluence --output harbor_summary_confluence.xml
+```
+
 To connect to Harbor instances with self-signed certificates, add `--insecure` to disable TLS verification.
 
 ### Full set of options
@@ -59,8 +66,8 @@ To connect to Harbor instances with self-signed certificates, add `--insecure` t
 | `-p`, `--password` | Harbor password to pair with `--username`. | Prompted when omitted |
 | `-t`, `--api-token` | Harbor robot or user API token (overrides username/password). | None |
 | `-k`, `--insecure` | Disable TLS verification (not recommended). | Disabled |
-| `-o`, `--output` | File path for the generated summary or project list. | `harbor_summary.html` (HTML) / `harbor_summary.md` (Markdown) |
-| `-f`, `--format` | Force `html` or `markdown` output. | Auto-detect from `--output` suffix |
+| `-o`, `--output` | File path for the generated summary or project list. | `harbor_summary.html` (HTML) / `harbor_summary.md` (Markdown) / `harbor_summary_confluence.xml` (Confluence storage) |
+| `-f`, `--format` | Force `html`, `markdown`, or `confluence` output. | Auto-detect from `--output` suffix (`.md`/`.markdown` → Markdown, `.xml`/`.confluence` → Confluence, otherwise HTML) |
 | `-s`, `--page-size` | Page size for Harbor API pagination. | `100` |
 | `-T`, `--timeout` | HTTP request timeout in seconds. | `30` |
 | `-P`, `--project` | Limit the summary to specific projects (repeatable / comma-separated). | All projects |
