@@ -825,9 +825,6 @@ def pull_singularity_images(
             project_dir.mkdir(parents=True, exist_ok=True)
             for repo in project.repositories:
                 repo_leaf = _strip_project_prefix(repo.name, project.name)
-                repo_dir = project_dir / _sanitize_for_fs(repo_leaf or repo.name, "repository")
-                repo_dir.mkdir(parents=True, exist_ok=True)
-
                 if not repo.artifacts:
                     print(f"Skipping pull for {repo.name}: no artifacts discovered.")
                     continue
@@ -847,7 +844,7 @@ def pull_singularity_images(
 
                         uri = f"{transport}://{registry_host}/{reference}"
                         filename_label = _sanitize_for_fs(label or "image", "image")
-                        outfile = repo_dir / f"{_sanitize_for_fs(repo_leaf or repo.name, 'repository')}-{filename_label}.sif"
+                        outfile = project_dir / f"{_sanitize_for_fs(repo_leaf or repo.name, 'repository')}-{filename_label}.sif"
                         cmd = [binary_path, "pull", "--disable-cache", str(outfile), uri]
                         result = subprocess.run(cmd, capture_output=True, text=True, env=env)
                         if result.returncode != 0:
