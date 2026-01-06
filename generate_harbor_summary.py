@@ -88,6 +88,8 @@ class ColumnDefinition:
     description: str
     html_renderer: "Callable[[RepositorySummary], str]"
     markdown_renderer: "Callable[[RepositorySummary], str]"
+    include_by_default: bool = True
+    requires_artifacts: bool = False
 
 
 def _render_repository_html(repo: RepositorySummary) -> str:
@@ -150,6 +152,32 @@ def _render_description_markdown(repo: RepositorySummary) -> str:
     return _escape_markdown(description)
 
 
+def _collect_repository_tags(repo: RepositorySummary) -> List[str]:
+    """Return a sorted list of unique tags across all artifacts in the repository."""
+    tags: Set[str] = set()
+    for artifact in repo.artifacts:
+        for tag in artifact.tags:
+            if tag:
+                tags.add(tag)
+    return sorted(tags)
+
+
+def _render_tags_html(repo: RepositorySummary) -> str:
+    """Render repository tags for HTML output."""
+    tags = _collect_repository_tags(repo)
+    if not tags:
+        return "—"
+    return ", ".join(f"<code>{escape(tag)}</code>" for tag in tags)
+
+
+def _render_tags_markdown(repo: RepositorySummary) -> str:
+    """Render repository tags for Markdown output."""
+    tags = _collect_repository_tags(repo)
+    if not tags:
+        return "—"
+    return ", ".join(f"`{_escape_markdown(tag)}`" for tag in tags)
+
+
 # Registry describing every column we can show in the summary tables.
 COLUMN_DEFINITIONS: Tuple[ColumnDefinition, ...] = (
     ColumnDefinition(
@@ -186,6 +214,15 @@ COLUMN_DEFINITIONS: Tuple[ColumnDefinition, ...] = (
         description="Repository description if available",
         html_renderer=_render_description_html,
         markdown_renderer=_render_description_markdown,
+    ),
+    ColumnDefinition(
+        key="tags",
+        label="Tags",
+        description="Unique tags across all artifacts in the repository",
+        html_renderer=_render_tags_html,
+        markdown_renderer=_render_tags_markdown,
+        include_by_default=False,
+        requires_artifacts=True,
     ),
 )
 
@@ -702,11 +739,11 @@ def build_confluence_storage(
     return "\n".join(parts)
 
 
-def collect_data(args: argparse.Namespace) -> List[HarborInstanceSummary]:
-    """Fetch projects and repositories from one or more Harbor instances."""
+def collect_data(args: argparse.Namespace, columns: List[ColumnDefinition]) -> List[HarborInstanceSummary]:
+    """Fetch projects and repositories from Harbor, retrieving artifacts when needed."""
     instances = _prepare_instances(args)
     global_filters, global_lookup = _prepare_project_filters(getattr(args, "projects", None))
-    collect_artifacts = bool(getattr(args, "pull_dir", None))
+    collect_artifacts = bool(getattr(args, "pull_dir", None)) or _columns_require_artifacts(columns)
 
     all_projects: List[HarborInstanceSummary] = []
 
@@ -924,7 +961,8 @@ def _prepare_columns(
 ) -> List[ColumnDefinition]:
     """Resolve the requested columns into `ColumnDefinition` objects."""
     if not raw_columns:
-        return list(COLUMN_DEFINITIONS)
+        defaults = [column for column in COLUMN_DEFINITIONS if column.include_by_default]
+        return defaults or list(COLUMN_DEFINITIONS)
     tokens: List[str] = []
     for raw_value in raw_columns:
         if raw_value is None:
@@ -947,8 +985,14 @@ def _prepare_columns(
         seen.add(key)
         resolved.append(column)
     if not resolved:
-        return list(COLUMN_DEFINITIONS)
+        defaults = [column for column in COLUMN_DEFINITIONS if column.include_by_default]
+        return defaults or list(COLUMN_DEFINITIONS)
     return resolved
+
+
+def _columns_require_artifacts(columns: List[ColumnDefinition]) -> bool:
+    """Determine whether any selected column needs per-artifact data (tags/digests)."""
+    return any(column.requires_artifacts for column in columns)
 
 
 def _print_available_columns() -> None:
@@ -1064,7 +1108,7 @@ def main() -> None:
             args.output = DEFAULT_HTML_OUTPUT_FILENAME
     columns = _prepare_columns(getattr(args, "columns", None))
     try:
-        instances = collect_data(args)
+        instances = collect_data(args, columns)
     except requests.HTTPError as exc:
         response = exc.response
         details = f"[{response.status_code}] {response.text}" if response is not None else str(exc)
