@@ -6,7 +6,8 @@ This repository contains a standalone Python script that connects to a Harbor in
 
 - Python 3.8+  
 - `requests` (`pip install requests`)
-- `singularity` / `apptainer` (optional; only needed when using `--pull-dir` to pull images)
+- `singularity` / `apptainer` (optional; only needed when using `--pull-dir` with the `singularity` pull method)
+- `oras` (`pip install oras`, optional; only needed when using `--pull-method oras-python`)
 
 ### Usage
 
@@ -36,6 +37,14 @@ python3 generate_harbor_summary.py \
   --pull-overwrite --singularity-bin apptainer
 ```
 Provide a username along with your token when pulls require authentication.
+
+To pull using the Python ORAS client instead of Singularity/Apptainer:
+
+```bash
+python3 generate_harbor_summary.py \
+  --instance https://harbor.example.com,username=robot$user,api-token="$HARBOR_TOKEN" \
+  --pull-dir ./pulled_images --pull-method oras-python --pull-overwrite
+```
 
 Short aliases are available for quicker invocations (for example `-B` for `--instance`, `-b` for `--base-url`, `-o` for `--output`, `-P` for `--project`, and `-c` for `--column`).
 
@@ -90,8 +99,9 @@ To connect to Harbor instances with self-signed certificates, add `--insecure` t
 | `-t`, `--api-token` | Harbor robot or user API token (overrides username/password). | None |
 | `-k`, `--insecure` | Disable TLS verification (not recommended). | Disabled |
 | `-o`, `--output` | File path for the generated summary or project list. | `harbor_summary.html` (HTML) / `harbor_summary.md` (Markdown) / `harbor_summary_confluence.xml` (Confluence storage) |
-| `--pull-dir` | Directory where Singularity/Apptainer pulls of all summarised repositories are saved as `.sif`. | None |
-| `--pull-transport` | Transport for pulls (`oras` or `docker`). | `oras` |
+| `--pull-dir` | Directory where pulled images are saved as `.sif` files. | None |
+| `--pull-method` | Pull method (`singularity` or `oras-python`). | `singularity` |
+| `--pull-transport` | Transport for singularity/apptainer pulls (`oras` or `docker`). | `oras` |
 | `--pull-fallback` | Retry failed pulls with the opposite transport (oras↔docker). | Disabled |
 | `--pull-overwrite` | Overwrite existing pulled `.sif` files instead of skipping them. | Disabled |
 | `--singularity-bin` | Singularity/Apptainer executable to run for pulls. | `singularity` |

@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from html import escape
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Set, Tuple
 from urllib.parse import quote, urljoin, urlparse
 
@@ -289,15 +290,26 @@ def parse_args() -> argparse.Namespace:
         "--pull-dir",
         metavar="DIR",
         help=(
-            "Optional directory where Singularity/Apptainer pulls of all summarised repositories will be saved "
+            "Optional directory where pulls of all summarised repositories will be saved "
             "as .sif files."
+        ),
+    )
+    parser.add_argument(
+        "--pull-method",
+        choices=("singularity", "oras-python"),
+        default="singularity",
+        help=(
+            "Method to use when pulling images: singularity/apptainer CLI or the Python ORAS client."
         ),
     )
     parser.add_argument(
         "--pull-transport",
         choices=("oras", "docker"),
         default="oras",
-        help="Transport to use when pulling images (oras is recommended for SIF stored in Harbor).",
+        help=(
+            "Transport to use when pulling images with singularity/apptainer "
+            "(oras is recommended for SIF stored in Harbor)."
+        ),
     )
     parser.add_argument(
         "--pull-fallback",
@@ -312,7 +324,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--singularity-bin",
         default="singularity",
-        help="Executable to use for pulling images (e.g. singularity or apptainer).",
+        help="Executable to use for pulling images with singularity/apptainer (e.g. singularity or apptainer).",
     )
     parser.add_argument(
         "-f",
@@ -946,6 +958,127 @@ def pull_singularity_images(
                             )
 
 
+def _move_oras_file(src: str, dest: Path, overwrite: bool) -> bool:
+    if dest.exists() and not overwrite:
+        return False
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists():
+        if dest.is_dir():
+            shutil.rmtree(dest)
+        else:
+            dest.unlink()
+    shutil.move(src, dest)
+    return True
+
+
+def pull_oras_images(
+    instances: List[HarborInstanceSummary],
+    *,
+    pull_dir: str,
+    overwrite: bool,
+    insecure: bool,
+) -> None:
+    """Pull all discovered artifacts using the Python ORAS client."""
+    if not pull_dir:
+        return
+
+    try:
+        import oras.client
+    except ImportError as exc:
+        raise SystemExit(
+            "Error: Python package 'oras' is required for --pull-method oras-python. "
+            "Install it with: pip install oras"
+        ) from exc
+
+    destination_root = Path(pull_dir)
+    destination_root.mkdir(parents=True, exist_ok=True)
+
+    for instance in instances:
+        registry_host = _registry_host_from_base_url(instance.base_url)
+        if not registry_host:
+            registry_host = _sanitize_for_fs(instance.base_url, "harbor")
+        instance_dir = destination_root / _sanitize_for_fs(registry_host, "harbor")
+        instance_dir.mkdir(parents=True, exist_ok=True)
+
+        scheme = urlparse(instance.base_url).scheme.lower()
+        client = oras.client.OrasClient(
+            hostname=registry_host,
+            insecure=scheme == "http",
+            tls_verify=not insecure,
+        )
+        password = instance.password or instance.api_token
+        if instance.username and password:
+            client.login(username=instance.username, password=password)
+        elif password and not instance.username:
+            raise SystemExit(
+                f"Error: ORAS pulls for {instance.base_url} require a username with the token/password."
+            )
+
+        for project in instance.projects:
+            project_dir = instance_dir / _sanitize_for_fs(project.name, "project")
+            project_dir.mkdir(parents=True, exist_ok=True)
+            for repo in project.repositories:
+                repo_leaf = _strip_project_prefix(repo.name, project.name)
+                if not repo.artifacts:
+                    print(f"Skipping pull for {repo.name}: no artifacts discovered.")
+                    continue
+
+                seen_refs: Set[str] = set()
+                for artifact in repo.artifacts:
+                    candidates: List[Tuple[str, str]] = []
+                    if artifact.tags:
+                        candidates.extend((f"{repo.name}:{tag}", tag) for tag in artifact.tags if tag)
+                    if not candidates and artifact.digest:
+                        candidates.append((f"{repo.name}@{artifact.digest}", artifact.digest))
+
+                    for reference, label in candidates:
+                        if reference in seen_refs:
+                            continue
+                        seen_refs.add(reference)
+
+                        filename_label = _sanitize_for_fs(label or "image", "image")
+                        outfile = project_dir / f"{_sanitize_for_fs(repo_leaf or repo.name, 'repository')}-{filename_label}.sif"
+                        if outfile.exists() and not overwrite:
+                            print(f"Skipping existing image {outfile}")
+                            continue
+
+                        target = f"{registry_host}/{reference}"
+                        with TemporaryDirectory() as tmpdir:
+                            try:
+                                pulled_files = client.pull(
+                                    target=target,
+                                    outdir=tmpdir,
+                                    overwrite=True,
+                                )
+                            except Exception as exc:
+                                print(
+                                    f"Failed to pull {target} via ORAS client: {exc}",
+                                    file=sys.stderr,
+                                )
+                                continue
+
+                            if not pulled_files:
+                                print(f"No artifacts pulled for {target}", file=sys.stderr)
+                                continue
+
+                            if len(pulled_files) == 1:
+                                moved = _move_oras_file(pulled_files[0], outfile, overwrite)
+                                if moved:
+                                    print(f"Pulled {target} -> {outfile}")
+                                else:
+                                    print(f"Skipping existing image {outfile}")
+                                continue
+
+                            bundle_dir = project_dir / f"{outfile.stem}_files"
+                            bundle_dir.mkdir(parents=True, exist_ok=True)
+                            for pulled in pulled_files:
+                                dest = bundle_dir / Path(pulled).name
+                                moved = _move_oras_file(pulled, dest, overwrite)
+                                if not moved:
+                                    print(f"Skipping existing file {dest}")
+                            print(f"Pulled {target} -> {bundle_dir}")
+
+
 def _escape_markdown(value: Any) -> str:
     """Escape characters that would break Markdown table formatting."""
     text = str(value)
@@ -1117,14 +1250,22 @@ def main() -> None:
         raise SystemExit(f"Network error while contacting Harbor: {exc}") from exc
 
     if getattr(args, "pull_dir", None):
-        pull_singularity_images(
-            instances,
-            pull_dir=args.pull_dir,
-            transport=args.pull_transport,
-            singularity_bin=args.singularity_bin,
-            overwrite=getattr(args, "pull_overwrite", False),
-            fallback_opposite=getattr(args, "pull_fallback", False),
-        )
+        if args.pull_method == "oras-python":
+            pull_oras_images(
+                instances,
+                pull_dir=args.pull_dir,
+                overwrite=getattr(args, "pull_overwrite", False),
+                insecure=args.insecure,
+            )
+        else:
+            pull_singularity_images(
+                instances,
+                pull_dir=args.pull_dir,
+                transport=args.pull_transport,
+                singularity_bin=args.singularity_bin,
+                overwrite=getattr(args, "pull_overwrite", False),
+                fallback_opposite=getattr(args, "pull_fallback", False),
+            )
 
     if output_format == "markdown":
         summary = build_markdown(instances, columns)
