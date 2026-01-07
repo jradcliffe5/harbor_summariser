@@ -37,6 +37,7 @@ UTC = timezone.utc
 DEFAULT_HTML_OUTPUT_FILENAME = "harbor_summary.html"
 DEFAULT_MARKDOWN_OUTPUT_FILENAME = "harbor_summary.md"
 DEFAULT_CONFLUENCE_OUTPUT_FILENAME = "harbor_summary_confluence.xml"
+PULL_METHODS = ("oras", "docker", "oras-python")
 
 
 @dataclass
@@ -70,6 +71,7 @@ class HarborInstanceConfig:
     password: Optional[str]
     api_token: Optional[str]
     projects: Optional[List[str]] = None
+    pull_method: Optional[str] = None
 
 
 @dataclass
@@ -80,6 +82,7 @@ class HarborInstanceSummary:
     password: Optional[str] = None
     api_token: Optional[str] = None
     project_filters: Optional[List[str]] = None
+    pull_method: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -230,6 +233,14 @@ COLUMN_DEFINITIONS: Tuple[ColumnDefinition, ...] = (
 COLUMN_REGISTRY: Dict[str, ColumnDefinition] = {column.key: column for column in COLUMN_DEFINITIONS}
 
 
+def _normalize_pull_method(value: str, *, source: str) -> str:
+    normalized = value.strip().lower().replace("_", "-")
+    if normalized not in PULL_METHODS:
+        allowed = ", ".join(PULL_METHODS)
+        raise SystemExit(f"Invalid pull method '{value}' in {source}. Choose from: {allowed}.")
+    return normalized
+
+
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments for the summary generator."""
 
@@ -241,7 +252,7 @@ def parse_args() -> argparse.Namespace:
         "--instance",
         dest="instances",
         action="append",
-        metavar="BASE_URL[,api-token=TOKEN][,username=USER][,password=PASS]",
+        metavar="BASE_URL[,api-token=TOKEN][,username=USER][,password=PASS][,pull-method=METHOD]",
         help=(
             "Connect to an additional Harbor instance. Repeat this flag to summarize multiple Harbor instances "
             "in a single run. Per-instance credentials override the global username/password or api-token flags."
@@ -296,20 +307,17 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--pull-method",
-        choices=("singularity", "oras-python"),
-        default="singularity",
+        choices=PULL_METHODS,
+        default=None,
         help=(
-            "Method to use when pulling images: singularity/apptainer CLI or the Python ORAS client."
+            "Pull method: oras or docker (via singularity/apptainer) or oras-python (via Python ORAS client)."
         ),
     )
     parser.add_argument(
         "--pull-transport",
         choices=("oras", "docker"),
-        default="oras",
-        help=(
-            "Transport to use when pulling images with singularity/apptainer "
-            "(oras is recommended for SIF stored in Harbor)."
-        ),
+        default=None,
+        help="Deprecated: use --pull-method (oras or docker).",
     )
     parser.add_argument(
         "--pull-fallback",
@@ -387,6 +395,16 @@ def parse_args() -> argparse.Namespace:
     args.explicit_output = args.output is not None
     if args.output is None:
         args.output = DEFAULT_HTML_OUTPUT_FILENAME
+    if args.pull_method is None:
+        if args.pull_transport is not None:
+            args.pull_method = args.pull_transport
+        else:
+            args.pull_method = "oras"
+    elif args.pull_transport is not None:
+        if args.pull_method == "oras-python":
+            parser.error("--pull-transport is not compatible with --pull-method oras-python.")
+        if args.pull_method != args.pull_transport:
+            parser.error("--pull-transport conflicts with --pull-method; use one or the other.")
     return args
 
 
@@ -426,6 +444,18 @@ def _parse_instance_spec(raw_value: str) -> HarborInstanceConfig:
     api_token = values.pop("api-token", None)
     username = values.pop("username", None)
     password = values.pop("password", None)
+    raw_pull_method = values.pop("pull-method", None) or values.pop("pull_method", None)
+    raw_pull_transport = values.pop("pull-transport", None) or values.pop("pull_transport", None)
+    pull_method: Optional[str] = None
+    if raw_pull_method:
+        pull_method = _normalize_pull_method(raw_pull_method, source="--instance")
+    if raw_pull_transport:
+        transport_method = _normalize_pull_method(raw_pull_transport, source="--instance")
+        if transport_method == "oras-python":
+            raise SystemExit("pull-transport does not accept oras-python; use pull-method instead.")
+        if pull_method and pull_method != transport_method:
+            raise SystemExit("pull-method and pull-transport conflict in --instance.")
+        pull_method = pull_method or transport_method
     if values:
         unknown_keys = ", ".join(sorted(values.keys()))
         raise SystemExit(f"Unknown --instance keys: {unknown_keys}")
@@ -441,6 +471,7 @@ def _parse_instance_spec(raw_value: str) -> HarborInstanceConfig:
         password=password,
         api_token=api_token,
         projects=projects or None,
+        pull_method=pull_method,
     )
 
 
@@ -457,10 +488,14 @@ def _prepare_instances(args: argparse.Namespace) -> List[HarborInstanceConfig]:
                 password=args.password,
                 api_token=args.api_token,
                 projects=None,
+                pull_method=args.pull_method,
             )
         )
     if not instances:
         raise SystemExit("Error: at least one Harbor instance must be provided.")
+    for instance in instances:
+        if instance.pull_method is None:
+            instance.pull_method = args.pull_method
     return instances
 
 
@@ -829,6 +864,7 @@ def collect_data(args: argparse.Namespace, columns: List[ColumnDefinition]) -> L
                 password=instance.password,
                 api_token=instance.api_token,
                 project_filters=instance.projects,
+                pull_method=instance.pull_method,
             )
         )
 
@@ -977,6 +1013,7 @@ def pull_oras_images(
     pull_dir: str,
     overwrite: bool,
     insecure: bool,
+    default_username: Optional[str],
 ) -> None:
     """Pull all discovered artifacts using the Python ORAS client."""
     if not pull_dir:
@@ -1006,12 +1043,14 @@ def pull_oras_images(
             insecure=scheme == "http",
             tls_verify=not insecure,
         )
+        username = instance.username or default_username
         password = instance.password or instance.api_token
-        if instance.username and password:
-            client.login(username=instance.username, password=password)
-        elif password and not instance.username:
+        if username and password:
+            client.login(username=username, password=password)
+        elif password and not username:
             raise SystemExit(
-                f"Error: ORAS pulls for {instance.base_url} require a username with the token/password."
+                f"Error: ORAS pulls for {instance.base_url} require a username with the token/password. "
+                "Provide username=... in --instance or set --username."
             )
 
         for project in instance.projects:
@@ -1250,18 +1289,34 @@ def main() -> None:
         raise SystemExit(f"Network error while contacting Harbor: {exc}") from exc
 
     if getattr(args, "pull_dir", None):
-        if args.pull_method == "oras-python":
+        oras_python_instances = [
+            instance for instance in instances if instance.pull_method == "oras-python"
+        ]
+        oras_instances = [instance for instance in instances if instance.pull_method == "oras"]
+        docker_instances = [instance for instance in instances if instance.pull_method == "docker"]
+
+        if oras_python_instances:
             pull_oras_images(
-                instances,
+                oras_python_instances,
                 pull_dir=args.pull_dir,
                 overwrite=getattr(args, "pull_overwrite", False),
                 insecure=args.insecure,
+                default_username=args.username,
             )
-        else:
+        if oras_instances:
             pull_singularity_images(
-                instances,
+                oras_instances,
                 pull_dir=args.pull_dir,
-                transport=args.pull_transport,
+                transport="oras",
+                singularity_bin=args.singularity_bin,
+                overwrite=getattr(args, "pull_overwrite", False),
+                fallback_opposite=getattr(args, "pull_fallback", False),
+            )
+        if docker_instances:
+            pull_singularity_images(
+                docker_instances,
+                pull_dir=args.pull_dir,
+                transport="docker",
                 singularity_bin=args.singularity_bin,
                 overwrite=getattr(args, "pull_overwrite", False),
                 fallback_opposite=getattr(args, "pull_fallback", False),
