@@ -44,6 +44,7 @@ PULL_METHODS = ("oras", "docker", "oras-python")
 class ArtifactSummary:
     digest: Optional[str]
     tags: List[str]
+    push_time: Optional[str] = None
 
 
 @dataclass
@@ -72,6 +73,7 @@ class HarborInstanceConfig:
     api_token: Optional[str]
     projects: Optional[List[str]] = None
     pull_method: Optional[str] = None
+    newest_only: bool = False
 
 
 @dataclass
@@ -252,7 +254,7 @@ def parse_args() -> argparse.Namespace:
         "--instance",
         dest="instances",
         action="append",
-        metavar="BASE_URL[,api-token=TOKEN][,username=USER][,password=PASS][,pull-method=METHOD]",
+        metavar="BASE_URL[,api-token=TOKEN][,username=USER][,password=PASS][,pull-method=METHOD][,newest-only=true]",
         help=(
             "Connect to an additional Harbor instance. Repeat this flag to summarize multiple Harbor instances "
             "in a single run. Per-instance credentials override the global username/password or api-token flags."
@@ -388,6 +390,15 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="List Harbor projects (with repository counts) and exit.",
     )
+    parser.add_argument(
+        "--newest-only",
+        action="store_true",
+        help=(
+            "Only retain the most recently pushed artifact per repository "
+            "(determined by push_time). Useful when pulling to avoid downloading "
+            "every historical version."
+        ),
+    )
 
     args = parser.parse_args()
     if not args.base_url and not getattr(args, "instances", None):
@@ -444,6 +455,8 @@ def _parse_instance_spec(raw_value: str) -> HarborInstanceConfig:
     api_token = values.pop("api-token", None)
     username = values.pop("username", None)
     password = values.pop("password", None)
+    raw_newest_only = values.pop("newest-only", None) or values.pop("newest_only", None)
+    newest_only = raw_newest_only is not None and raw_newest_only.lower() not in {"false", "0", "no"}
     raw_pull_method = values.pop("pull-method", None) or values.pop("pull_method", None)
     raw_pull_transport = values.pop("pull-transport", None) or values.pop("pull_transport", None)
     pull_method: Optional[str] = None
@@ -472,6 +485,7 @@ def _parse_instance_spec(raw_value: str) -> HarborInstanceConfig:
         api_token=api_token,
         projects=projects or None,
         pull_method=pull_method,
+        newest_only=newest_only,
     )
 
 
@@ -613,8 +627,18 @@ def _fetch_artifacts_for_repository(
             if tag_name:
                 tags.append(str(tag_name))
         digest = artifact.get("digest")
-        artifacts.append(ArtifactSummary(digest=str(digest) if digest else None, tags=tags))
+        push_time = artifact.get("push_time")
+        artifacts.append(ArtifactSummary(digest=str(digest) if digest else None, tags=tags, push_time=str(push_time) if push_time else None))
     return artifacts
+
+
+def _newest_artifact(artifacts: List[ArtifactSummary]) -> List[ArtifactSummary]:
+    """Return a single-element list containing the most recently pushed artifact."""
+    if not artifacts:
+        return artifacts
+    def _push_key(a: ArtifactSummary) -> str:
+        return a.push_time or ""
+    return [max(artifacts, key=_push_key)]
 
 
 def format_timestamp(value: Optional[str]) -> str:
@@ -841,6 +865,8 @@ def collect_data(args: argparse.Namespace, columns: List[ColumnDefinition]) -> L
                         page_size=args.page_size,
                         timeout=timeout,
                     )
+                    if instance.newest_only or getattr(args, "newest_only", False):
+                        artifacts = _newest_artifact(artifacts)
                 repositories.append(
                     RepositorySummary(
                         name=repo_name,
